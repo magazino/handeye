@@ -4,6 +4,9 @@ import numpy as np
 import scipy.linalg
 import baldor as br
 from baldor.vector import skew
+from dual_quaternions import DualQuaternion
+from tf.transformations import quaternion_from_matrix
+from geometry_msgs.msg import Pose, Quaternion, Point
 
 
 class SolverBase(object):
@@ -73,6 +76,73 @@ class SolverBase(object):
         d = np.array(d).flatten()
         tx, residuals, rank, s = np.linalg.lstsq(C, d, rcond=-1)
         return tx.flatten()
+
+    @staticmethod
+    def transform_to_dual_quaternion(T):
+        q = quaternion_from_matrix(T)
+        p = Pose(position=Point(*T[:3,3]),orientation=Quaternion(*q))
+        tra = p.position
+        rot = p.orientation
+        p_dq=DualQuaternion.from_quat_pose_array([rot.w, rot.x, rot.y, rot.z, tra.x, tra.y, tra.z])
+        dq_array = np.array(p_dq.dq_array())
+        return dq_array[:4], dq_array[4:]
+
+
+class UlrichSteger2016(SolverBase):
+    """
+    Hand-Eye calibration solver that uses dual quaternions.
+
+    Implementation based on: :cite:`Daniilidis1999`.
+    """
+
+    def __call__(self, A, B):
+        # Step 1. Populate T using eq.(31) and eq.(33)
+        S = np.zeros((6, 8))
+        T = np.zeros((6*len(A), 8))
+        for i, (Ai, Bi) in enumerate(zip(A, B)):
+            qr_Ai, qt_Ai = self.transform_to_dual_quaternion(Ai)
+            qr_Bi, qt_Bi = self.transform_to_dual_quaternion(Bi)
+            a = qr_Ai[1:].reshape(3, 1)
+            b = qr_Bi[1:].reshape(3, 1)
+            a_ = qt_Ai[1:].reshape(3, 1)
+            b_ = qt_Bi[1:].reshape(3, 1)
+            S[:3, :] = np.hstack((a-b, skew(a+b), np.zeros((3, 4))))
+            S[3:, :] = np.hstack((a_-b_, skew(a_+b_), a-b, skew(a+b)))
+            row = 6*i
+            T[row:row+6, :] = S
+        # Step 2. Compute the SVD of T
+        U, S, V = np.linalg.svd(T)
+        # Step 3. Compute the coefficients of eq.(35)
+        v6 = V.T[:, 5]
+        v7 = V.T[:, 6]
+        u1 = v6[:4].reshape(4, 1)
+        v1 = v6[4:].reshape(4, 1)
+        u2 = v7[:4].reshape(4, 1)
+        v2 = v7[4:].reshape(4, 1)
+        coeff = np.zeros(3)
+        coeff[0] = np.dot(u1.T, v1)
+        coeff[1] = np.dot(u1.T, v2) + np.dot(u2.T, v1)
+        coeff[2] = np.dot(u2.T, v2)
+        s_list = np.roots(coeff)
+        # Step 4. Choose the good s and compute lambdas
+        vals = []
+        for s in s_list:
+            val = (s**2)*np.dot(u1.T, u1) + 2*s * \
+                np.dot(u1.T, u2) + np.dot(u2.T, u2)
+            vals.append(float(val))
+        idx = np.argmax(vals)
+        max_val = vals[idx]
+        s = s_list[idx]
+        lbda2 = np.sqrt(1/max_val)
+        lbda1 = s*lbda2
+        # Step 5. Get the result and re-arrange for our notation
+        sol = lbda1*v6 + lbda2*v7
+        qr = sol[:4]
+        qr /= np.linalg.norm(qr)            # Normalize just in case
+        qt = sol[4:]
+        X = br.quaternion.dual_to_transform(qr, qt)
+        X[2][3] = 0.0 # z-trans can not be estimated but manually measured
+        return X
 
 
 class Daniilidis1999(SolverBase):
